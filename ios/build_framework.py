@@ -38,9 +38,9 @@ def build_opencv(srcroot, buildroot, target, arch):
     # for some reason, if you do not specify CMAKE_BUILD_TYPE, it puts libs to "RELEASE" rather than "Release"
     cmakeargs = ("-GXcode " +
                 "-DCMAKE_TOOLCHAIN_FILE=%s/ios/cmake/Toolchains/Toolchain-%s_Xcode.cmake " +
-                "-DWITH_SSL=0 " +
-                "-DWITHOUT_SERVER=1 " +
-                "-DWITHOUT_TESTAPPS=1 " +
+                "-DLWS_WITH_SSL=OFF " +
+                "-DLWS_WITHOUT_SERVER=ON " +
+                "-DLWS_WITHOUT_TESTAPPS=ON " +
                 "-DCMAKE_INSTALL_PREFIX:PATH=/Users/james/Project/libwebsockets/install") % (srcroot, target)
     # if cmake cache exists, just rerun cmake to update OpenCV.xproj if necessary
     if os.path.isfile(os.path.join(builddir, "CMakeCache.txt")):
@@ -113,8 +113,8 @@ def put_framework_together(srcroot, dstroot):
 def build_framework(srcroot, dstroot):
     "main function to do all the work"
 
-    targets = ["iPhoneOS", "iPhoneOS", "iPhoneSimulator"]
-    archs = ["armv7", "armv7s", "i386"]
+    targets = ["iPhoneOS", "iPhoneOS", "iPhoneOS", "iPhoneSimulator"]
+    archs = ["armv7", "armv7s", "arm64", "i386"]
     for i in range(len(targets)):
         build_opencv(srcroot, os.path.join(dstroot, "build"), targets[i], archs[i])
 
@@ -128,6 +128,7 @@ def build_framework(srcroot, dstroot):
         + build_root+"/iPhoneSimulator-i386"+lib_path
         + build_root+"/iPhoneOS-armv7"+lib_path
         + build_root+"/iPhoneOS-armv7s"+lib_path
+        + build_root+"/iPhoneOS-arm64"+lib_path
         )
     os.system(strip + "-S " + build_root+"/libwebsockets.a")
     os.system(lipo + "-info " + build_root+"/libwebsockets.a")

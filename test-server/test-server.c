@@ -24,41 +24,36 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <getopt.h>
+#include <signal.h>
 #include <string.h>
-#include <sys/time.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <assert.h>
-#ifdef WIN32
 
+#ifdef _WIN32
+#include <io.h>
 #ifdef EXTERNAL_POLL
-	#ifndef WIN32_LEAN_AND_MEAN
-	#define WIN32_LEAN_AND_MEAN
-	#endif
-	#include <winsock2.h>
-	#include <ws2tcpip.h>
-	#include <stddef.h>
-
-	#include "websock-w32.h"
+#define poll WSAPoll
 #endif
-
-#else // NOT WIN32
+#else
 #include <syslog.h>
+#include <sys/time.h>
+#include <unistd.h>
 #endif
-
-#include <signal.h>
 
 #include "../lib/libwebsockets.h"
 
 static int close_testing;
 int max_poll_elements;
 
+#ifdef EXTERNAL_POLL
 struct pollfd *pollfds;
 int *fd_lookup;
 int count_pollfds;
-int force_exit = 0;
+#endif
+static volatile int force_exit = 0;
+static struct libwebsocket_context *context;
 
 /*
  * This demo server shows how to use libwebsockets for one or more
@@ -99,17 +94,60 @@ struct serveable {
 	const char *mimetype;
 }; 
 
-static const struct serveable whitelist[] = {
-	{ "/favicon.ico", "image/x-icon" },
-	{ "/libwebsockets.org-logo.png", "image/png" },
-
-	/* last one is the default served if no match */
-	{ "/test.html", "text/html" },
-};
-
 struct per_session_data__http {
 	int fd;
 };
+
+/*
+ * this is just an example of parsing handshake headers, you don't need this
+ * in your code unless you will filter allowing connections by the header
+ * content
+ */
+
+static void
+dump_handshake_info(struct libwebsocket *wsi)
+{
+	int n = 0;
+	char buf[256];
+	const unsigned char *c;
+
+	do {
+		c = lws_token_to_string(n);
+		if (!c) {
+			n++;
+			continue;
+		}
+
+		if (!lws_hdr_total_length(wsi, n)) {
+			n++;
+			continue;
+		}
+
+		lws_hdr_copy(wsi, buf, sizeof buf, n);
+
+		fprintf(stderr, "    %s = %s\n", (char *)c, buf);
+		n++;
+	} while (c);
+}
+
+const char * get_mimetype(const char *file)
+{
+	int n = strlen(file);
+
+	if (n < 5)
+		return NULL;
+
+	if (!strcmp(&file[n - 4], ".ico"))
+		return "image/x-icon";
+
+	if (!strcmp(&file[n - 4], ".png"))
+		return "image/png";
+
+	if (!strcmp(&file[n - 5], ".html"))
+		return "text/html";
+
+	return NULL;
+}
 
 /* this protocol server (always the first one) just knows how to do HTTP */
 
@@ -118,24 +156,43 @@ static int callback_http(struct libwebsocket_context *context,
 		enum libwebsocket_callback_reasons reason, void *user,
 							   void *in, size_t len)
 {
-#if 0
-	char client_name[128];
-	char client_ip[128];
-#endif
 	char buf[256];
 	char leaf_path[1024];
+	char b64[64];
+	struct timeval tv;
 	int n, m;
 	unsigned char *p;
+	char *other_headers;
 	static unsigned char buffer[4096];
 	struct stat stat_buf;
 	struct per_session_data__http *pss =
 			(struct per_session_data__http *)user;
+	const char *mimetype;
 #ifdef EXTERNAL_POLL
-	int fd = (int)(long)in;
+	struct libwebsocket_pollargs *pa = (struct libwebsocket_pollargs *)in;
 #endif
-
+	unsigned char *end;
 	switch (reason) {
 	case LWS_CALLBACK_HTTP:
+
+		dump_handshake_info(wsi);
+
+		if (len < 1) {
+			libwebsockets_return_http_status(context, wsi,
+						HTTP_STATUS_BAD_REQUEST, NULL);
+			goto try_to_reuse;
+		}
+
+		/* this example server has no concept of directories */
+		if (strchr((const char *)in + 1, '/')) {
+			libwebsockets_return_http_status(context, wsi,
+						HTTP_STATUS_FORBIDDEN, NULL);
+			goto try_to_reuse;
+		}
+
+		/* if a legal POST URL, let it continue and accept data */
+		if (lws_hdr_total_length(wsi, WSI_TOKEN_POST_URI))
+			return 0;
 
 		/* check for the "send a big file by hand" example case */
 
@@ -146,8 +203,8 @@ static int callback_http(struct libwebsocket_context *context,
 
 			/* well, let's demonstrate how to send the hard way */
 
-			p = buffer;
-
+			p = buffer + LWS_SEND_BUFFER_PRE_PADDING;
+			end = p + sizeof(buffer) - LWS_SEND_BUFFER_PRE_PADDING;
 #ifdef WIN32
 			pss->fd = open(leaf_path, O_RDONLY | _O_BINARY);
 #else
@@ -157,30 +214,52 @@ static int callback_http(struct libwebsocket_context *context,
 			if (pss->fd < 0)
 				return -1;
 
-			fstat(pss->fd, &stat_buf);
+			if (fstat(pss->fd, &stat_buf) < 0)
+				return -1;
 
 			/*
 			 * we will send a big jpeg file, but it could be
 			 * anything.  Set the Content-Type: appropriately
 			 * so the browser knows what to do with it.
+			 * 
+			 * Notice we use the APIs to build the header, which
+			 * will do the right thing for HTTP 1/1.1 and HTTP2
+			 * depending on what connection it happens to be working
+			 * on
 			 */
-
-			p += sprintf((char *)p,
-				"HTTP/1.0 200 OK\x0d\x0a"
-				"Server: libwebsockets\x0d\x0a"
-				"Content-Type: image/jpeg\x0d\x0a"
-					"Content-Length: %u\x0d\x0a\x0d\x0a",
-					(unsigned int)stat_buf.st_size);
+			if (lws_add_http_header_status(context, wsi, 200, &p, end))
+				return 1;
+			if (lws_add_http_header_by_token(context, wsi,
+					WSI_TOKEN_HTTP_SERVER,
+				    	(unsigned char *)"libwebsockets",
+					13, &p, end))
+				return 1;
+			if (lws_add_http_header_by_token(context, wsi,
+					WSI_TOKEN_HTTP_CONTENT_TYPE,
+				    	(unsigned char *)"image/jpeg",
+					10, &p, end))
+				return 1;
+			if (lws_add_http_header_content_length(context, wsi,
+						stat_buf.st_size, &p, end))
+				return 1;
+			if (lws_finalize_http_header(context, wsi, &p, end))
+				return 1;
 
 			/*
 			 * send the http headers...
 			 * this won't block since it's the first payload sent
 			 * on the connection since it was established
 			 * (too small for partial)
+			 * 
+			 * Notice they are sent using LWS_WRITE_HTTP_HEADERS
+			 * which also means you can't send body too in one step,
+			 * this is mandated by changes in HTTP2
 			 */
 
-			n = libwebsocket_write(wsi, buffer,
-				   p - buffer, LWS_WRITE_HTTP);
+			n = libwebsocket_write(wsi,
+					buffer + LWS_SEND_BUFFER_PRE_PADDING,
+					p - (buffer + LWS_SEND_BUFFER_PRE_PADDING),
+					LWS_WRITE_HTTP_HEADERS);
 
 			if (n < 0) {
 				close(pss->fd);
@@ -194,15 +273,51 @@ static int callback_http(struct libwebsocket_context *context,
 		}
 
 		/* if not, send a file the easy way */
+		strcpy(buf, resource_path);
+		if (strcmp(in, "/")) {
+			if (*((const char *)in) != '/')
+				strcat(buf, "/");
+			strncat(buf, in, sizeof(buf) - strlen(resource_path));
+		} else /* default file to serve */
+			strcat(buf, "/test.html");
+		buf[sizeof(buf) - 1] = '\0';
 
-		for (n = 0; n < (sizeof(whitelist) / sizeof(whitelist[0]) - 1); n++)
-			if (in && strcmp((const char *)in, whitelist[n].urlpath) == 0)
-				break;
+		/* refuse to serve files we don't understand */
+		mimetype = get_mimetype(buf);
+		if (!mimetype) {
+			lwsl_err("Unknown mimetype for %s\n", buf);
+			libwebsockets_return_http_status(context, wsi,
+				      HTTP_STATUS_UNSUPPORTED_MEDIA_TYPE, NULL);
+			return -1;
+		}
 
-		sprintf(buf, "%s%s", resource_path, whitelist[n].urlpath);
+		/* demostrates how to set a cookie on / */
 
-		if (libwebsockets_serve_http_file(context, wsi, buf, whitelist[n].mimetype))
-			return -1; /* through completion or error, close the socket */
+		other_headers = NULL;
+		n = 0;
+		if (!strcmp((const char *)in, "/") &&
+			   !lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_COOKIE)) {
+			/* this isn't very unguessable but it'll do for us */
+			gettimeofday(&tv, NULL);
+			n = sprintf(b64, "test=LWS_%u_%u_COOKIE;Max-Age=360000",
+				(unsigned int)tv.tv_sec,
+				(unsigned int)tv.tv_usec);
+
+			p = (unsigned char *)leaf_path;
+
+			if (lws_add_http_header_by_name(context, wsi, 
+				(unsigned char *)"set-cookie:", 
+				(unsigned char *)b64, n, &p,
+				(unsigned char *)leaf_path + sizeof(leaf_path)))
+				return 1;
+			n = (char *)p - leaf_path;
+			other_headers = leaf_path;
+		}
+
+		n = libwebsockets_serve_http_file(context, wsi, buf,
+						mimetype, other_headers, n);
+		if (n < 0 || ((n > 0) && lws_http_transaction_completed(wsi)))
+			return -1; /* error or can't reuse connection: close the socket */
 
 		/*
 		 * notice that the sending of the file completes asynchronously,
@@ -212,39 +327,100 @@ static int callback_http(struct libwebsocket_context *context,
 
 		break;
 
+	case LWS_CALLBACK_HTTP_BODY:
+		strncpy(buf, in, 20);
+		buf[20] = '\0';
+		if (len < 20)
+			buf[len] = '\0';
+
+		lwsl_notice("LWS_CALLBACK_HTTP_BODY: %s... len %d\n",
+				(const char *)buf, (int)len);
+
+		break;
+
+	case LWS_CALLBACK_HTTP_BODY_COMPLETION:
+		lwsl_notice("LWS_CALLBACK_HTTP_BODY_COMPLETION\n");
+		/* the whole of the sent body arrived, close or reuse the connection */
+		libwebsockets_return_http_status(context, wsi,
+						HTTP_STATUS_OK, NULL);
+		goto try_to_reuse;
+
 	case LWS_CALLBACK_HTTP_FILE_COMPLETION:
 //		lwsl_info("LWS_CALLBACK_HTTP_FILE_COMPLETION seen\n");
 		/* kill the connection after we sent one file */
-		return -1;
+		goto try_to_reuse;
 
 	case LWS_CALLBACK_HTTP_WRITEABLE:
 		/*
 		 * we can send more of whatever it is we were sending
 		 */
-
 		do {
-			n = read(pss->fd, buffer, sizeof buffer);
+			/* we'd like the send this much */
+			n = sizeof(buffer) - LWS_SEND_BUFFER_PRE_PADDING;
+			
+			/* but if the peer told us he wants less, we can adapt */
+			m = lws_get_peer_write_allowance(wsi);
+
+			/* -1 means not using a protocol that has this info */
+			if (m == 0)
+				/* right now, peer can't handle anything */
+				goto later;
+
+			if (m != -1 && m < n)
+				/* he couldn't handle that much */
+				n = m;
+			
+			n = read(pss->fd, buffer + LWS_SEND_BUFFER_PRE_PADDING,
+									n);
 			/* problem reading, close conn */
 			if (n < 0)
 				goto bail;
 			/* sent it all, close conn */
 			if (n == 0)
-				goto bail;
+				goto flush_bail;
 			/*
-			 * because it's HTTP and not websocket, don't need to take
-			 * care about pre and postamble
+			 * To support HTTP2, must take care about preamble space
+			 * 
+			 * identification of when we send the last payload frame
+			 * is handled by the library itself if you sent a
+			 * content-length header
 			 */
-			m = libwebsocket_write(wsi, buffer, n, LWS_WRITE_HTTP);
+			m = libwebsocket_write(wsi,
+					       buffer + LWS_SEND_BUFFER_PRE_PADDING,
+					       n, LWS_WRITE_HTTP);
 			if (m < 0)
 				/* write failed, close conn */
 				goto bail;
+
+			/*
+			 * http2 won't do this
+			 */
 			if (m != n)
 				/* partial write, adjust */
-				lseek(pss->fd, m - n, SEEK_CUR);
+				if (lseek(pss->fd, m - n, SEEK_CUR) < 0)
+					goto bail;
+
+			if (m) /* while still active, extend timeout */
+				libwebsocket_set_timeout(wsi,
+					PENDING_TIMEOUT_HTTP_CONTENT, 5);
+			
+			/* if we have indigestion, let him clear it before eating more */
+			if (lws_partial_buffered(wsi))
+				break;
 
 		} while (!lws_send_pipe_choked(wsi));
+
+later:
 		libwebsocket_callback_on_writable(context, wsi);
 		break;
+flush_bail:
+		/* true if still partial pending */
+		if (lws_partial_buffered(wsi)) {
+			libwebsocket_callback_on_writable(context, wsi);
+			break;
+		}
+		close(pss->fd);
+		goto try_to_reuse;
 
 bail:
 		close(pss->fd);
@@ -259,13 +435,7 @@ bail:
 	 */
 
 	case LWS_CALLBACK_FILTER_NETWORK_CONNECTION:
-#if 0
-		libwebsockets_get_peer_addresses(context, wsi, (int)(long)in, client_name,
-			     sizeof(client_name), client_ip, sizeof(client_ip));
 
-		fprintf(stderr, "Received network connect from %s (%s)\n",
-							client_name, client_ip);
-#endif
 		/* if we returned non-zero from here, we kill the connection */
 		break;
 
@@ -275,6 +445,20 @@ bail:
 	 * protocol 0 callback
 	 */
 
+	case LWS_CALLBACK_LOCK_POLL:
+		/*
+		 * lock mutex to protect pollfd state
+		 * called before any other POLL related callback
+		 */
+		break;
+
+	case LWS_CALLBACK_UNLOCK_POLL:
+		/*
+		 * unlock mutex to protect pollfd state when
+		 * called after any other POLL related callback
+		 */
+		break;
+
 	case LWS_CALLBACK_ADD_POLL_FD:
 
 		if (count_pollfds >= max_poll_elements) {
@@ -282,84 +466,52 @@ bail:
 			return 1;
 		}
 
-		fd_lookup[fd] = count_pollfds;
-		pollfds[count_pollfds].fd = fd;
-		pollfds[count_pollfds].events = (int)(long)len;
+		fd_lookup[pa->fd] = count_pollfds;
+		pollfds[count_pollfds].fd = pa->fd;
+		pollfds[count_pollfds].events = pa->events;
 		pollfds[count_pollfds++].revents = 0;
 		break;
 
 	case LWS_CALLBACK_DEL_POLL_FD:
 		if (!--count_pollfds)
 			break;
-		m = fd_lookup[fd];
+		m = fd_lookup[pa->fd];
 		/* have the last guy take up the vacant slot */
 		pollfds[m] = pollfds[count_pollfds];
 		fd_lookup[pollfds[count_pollfds].fd] = m;
 		break;
 
-	case LWS_CALLBACK_SET_MODE_POLL_FD:
-		pollfds[fd_lookup[fd]].events |= (int)(long)len;
+	case LWS_CALLBACK_CHANGE_MODE_POLL_FD:
+	        pollfds[fd_lookup[pa->fd]].events = pa->events;
 		break;
 
-	case LWS_CALLBACK_CLEAR_MODE_POLL_FD:
-		pollfds[fd_lookup[fd]].events &= ~(int)(long)len;
-		break;
 #endif
+
+	case LWS_CALLBACK_GET_THREAD_ID:
+		/*
+		 * if you will call "libwebsocket_callback_on_writable"
+		 * from a different thread, return the caller thread ID
+		 * here so lws can use this information to work out if it
+		 * should signal the poll() loop to exit and restart early
+		 */
+
+		/* return pthread_getthreadid_np(); */
+
+		break;
 
 	default:
 		break;
 	}
 
 	return 0;
+	
+try_to_reuse:
+	if (lws_http_transaction_completed(wsi))
+		return -1;
+
+	return 0;
 }
 
-/*
- * this is just an example of parsing handshake headers, you don't need this
- * in your code unless you will filter allowing connections by the header
- * content
- */
-
-static void
-dump_handshake_info(struct libwebsocket *wsi)
-{
-	int n;
-	static const char *token_names[WSI_TOKEN_COUNT] = {
-		/*[WSI_TOKEN_GET_URI]		=*/ "GET URI",
-		/*[WSI_TOKEN_HOST]		=*/ "Host",
-		/*[WSI_TOKEN_CONNECTION]	=*/ "Connection",
-		/*[WSI_TOKEN_KEY1]		=*/ "key 1",
-		/*[WSI_TOKEN_KEY2]		=*/ "key 2",
-		/*[WSI_TOKEN_PROTOCOL]		=*/ "Protocol",
-		/*[WSI_TOKEN_UPGRADE]		=*/ "Upgrade",
-		/*[WSI_TOKEN_ORIGIN]		=*/ "Origin",
-		/*[WSI_TOKEN_DRAFT]		=*/ "Draft",
-		/*[WSI_TOKEN_CHALLENGE]		=*/ "Challenge",
-
-		/* new for 04 */
-		/*[WSI_TOKEN_KEY]		=*/ "Key",
-		/*[WSI_TOKEN_VERSION]		=*/ "Version",
-		/*[WSI_TOKEN_SWORIGIN]		=*/ "Sworigin",
-
-		/* new for 05 */
-		/*[WSI_TOKEN_EXTENSIONS]	=*/ "Extensions",
-
-		/* client receives these */
-		/*[WSI_TOKEN_ACCEPT]		=*/ "Accept",
-		/*[WSI_TOKEN_NONCE]		=*/ "Nonce",
-		/*[WSI_TOKEN_HTTP]		=*/ "Http",
-		/*[WSI_TOKEN_MUXURL]	=*/ "MuxURL",
-	};
-	char buf[256];
-
-	for (n = 0; n < WSI_TOKEN_COUNT; n++) {
-		if (!lws_hdr_total_length(wsi, n))
-			continue;
-
-		lws_hdr_copy(wsi, buf, sizeof buf, n);
-
-		fprintf(stderr, "    %s = %s\n", token_names[n], buf);
-	}
-}
 
 /* dumb_increment protocol */
 
@@ -485,7 +637,7 @@ callback_lws_mirror(struct libwebsocket_context *context,
 				   LWS_SEND_BUFFER_PRE_PADDING,
 				   ringbuffer[pss->ringbuffer_tail].len,
 								LWS_WRITE_TEXT);
-			if (n < ringbuffer[pss->ringbuffer_tail].len) {
+			if (n < 0) {
 				lwsl_err("ERROR %d writing to mirror socket\n", n);
 				return -1;
 			}
@@ -505,7 +657,7 @@ callback_lws_mirror(struct libwebsocket_context *context,
 
 			// lwsl_debug("tx fifo %d\n", (ringbuffer_head - pss->ringbuffer_tail) & (MAX_MESSAGE_QUEUE - 1));
 
-			if (lws_send_pipe_choked(wsi)) {
+			if (lws_partial_buffered(wsi) || lws_send_pipe_choked(wsi)) {
 				libwebsocket_callback_on_writable(context, wsi);
 				break;
 			}
@@ -513,7 +665,11 @@ callback_lws_mirror(struct libwebsocket_context *context,
 			 * for tests with chrome on same machine as client and
 			 * server, this is needed to stop chrome choking
 			 */
+#ifdef _WIN32
+			Sleep(1);
+#else
 			usleep(1);
+#endif
 		}
 		break;
 
@@ -601,6 +757,7 @@ static struct libwebsocket_protocols protocols[] = {
 void sighandler(int sig)
 {
 	force_exit = 1;
+	libwebsocket_cancel_service(context);
 }
 
 static struct option options[] = {
@@ -608,9 +765,11 @@ static struct option options[] = {
 	{ "debug",	required_argument,	NULL, 'd' },
 	{ "port",	required_argument,	NULL, 'p' },
 	{ "ssl",	no_argument,		NULL, 's' },
+	{ "allow-non-ssl",	no_argument,		NULL, 'a' },
 	{ "interface",  required_argument,	NULL, 'i' },
 	{ "closetest",  no_argument,		NULL, 'c' },
-#ifndef LWS_NO_DAEMONIZE
+	{ "libev",  no_argument,		NULL, 'e' },
+	#ifndef LWS_NO_DAEMONIZE
 	{ "daemonize", 	no_argument,		NULL, 'D' },
 #endif
 	{ "resource_path", required_argument,		NULL, 'r' },
@@ -623,14 +782,13 @@ int main(int argc, char **argv)
 	char key_path[1024];
 	int n = 0;
 	int use_ssl = 0;
-	struct libwebsocket_context *context;
 	int opts = 0;
 	char interface_name[128] = "";
 	const char *iface = NULL;
 #ifndef WIN32
 	int syslog_options = LOG_PID | LOG_PERROR;
 #endif
-	unsigned int oldus = 0;
+	unsigned int ms, oldms = 0;
 	struct lws_context_creation_info info;
 
 	int debug_level = 7;
@@ -642,10 +800,13 @@ int main(int argc, char **argv)
 	info.port = 7681;
 
 	while (n >= 0) {
-		n = getopt_long(argc, argv, "ci:hsp:d:Dr:", options, NULL);
+		n = getopt_long(argc, argv, "eci:hsap:d:Dr:", options, NULL);
 		if (n < 0)
 			continue;
 		switch (n) {
+		case 'e':
+			opts |= LWS_SERVER_OPTION_LIBEV;
+			break;
 #ifndef LWS_NO_DAEMONIZE
 		case 'D':
 			daemonize = 1;
@@ -659,6 +820,9 @@ int main(int argc, char **argv)
 			break;
 		case 's':
 			use_ssl = 1;
+			break;
+		case 'a':
+			opts |= LWS_SERVER_OPTION_ALLOW_NON_SSL_ON_SSL_PORT;
 			break;
 		case 'p':
 			info.port = atoi(optarg);
@@ -711,8 +875,10 @@ int main(int argc, char **argv)
 	lws_set_log_level(debug_level, lwsl_emit_syslog);
 
 	lwsl_notice("libwebsockets test server - "
-			"(C) Copyright 2010-2013 Andy Green <andy@warmcat.com> - "
+			"(C) Copyright 2010-2015 Andy Green <andy@warmcat.com> - "
 						    "licensed under LGPL2.1\n");
+
+	printf("Using resource path \"%s\"\n", resource_path);
 #ifdef EXTERNAL_POLL
 	max_poll_elements = getdtablesize();
 	pollfds = malloc(max_poll_elements * sizeof (struct pollfd));
@@ -770,9 +936,10 @@ int main(int argc, char **argv)
 		 * as soon as it can take more packets (usually immediately)
 		 */
 
-		if (((unsigned int)tv.tv_usec - oldus) > 50000) {
+		ms = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+		if ((ms - oldms) > 50) {
 			libwebsocket_callback_on_writable_all_protocol(&protocols[PROTOCOL_DUMB_INCREMENT]);
-			oldus = tv.tv_usec;
+			oldms = ms;
 		}
 
 #ifdef EXTERNAL_POLL

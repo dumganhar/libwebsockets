@@ -21,25 +21,23 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <getopt.h>
 #include <string.h>
 #include <signal.h>
-#include <unistd.h>
-
-#include <sys/time.h>
 #include <sys/types.h>
-#ifndef WIN32
+
+#ifndef _WIN32
+#include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <unistd.h>
 #endif
 
 #ifdef CMAKE_BUILD
 #include "lws_config.h"
 #endif
-
-#include <netdb.h>
 
 #include "../lib/libwebsockets.h"
 
@@ -80,7 +78,7 @@ struct ping {
 };
 
 struct per_session_data__ping {
-	unsigned long ping_index;
+	uint64_t ping_index;
 
 	struct ping ringbuffer[PING_RINGBUFFER_SIZE];
 	int ringbuffer_head;
@@ -112,7 +110,7 @@ callback_lws_mirror(struct libwebsocket_context * this,
 	struct timeval tv;
 	unsigned char *p;
 	int shift;
-	unsigned long l;
+	uint64_t l;
 	unsigned long iv;
 	int n;
 	int match = 0;
@@ -163,7 +161,7 @@ callback_lws_mirror(struct libwebsocket_context * this,
 		l = 0;
 
 		while (shift >= 0) {
-			l |= (*p++) << shift;
+			l |= ((uint64_t)*p++) << shift;
 			shift -= 8;
 		}
 
@@ -192,7 +190,8 @@ callback_lws_mirror(struct libwebsocket_context * this,
 
 			if (!flood)
 				fprintf(stderr, "%d bytes from %s: req=%ld "
-				      "time=(unknown)\n", (int)len, address, l);
+				      "time=(unknown)\n", (int)len, address,
+					(long)l);
 			else
 				fprintf(stderr, "\b \b");
 
@@ -213,7 +212,7 @@ callback_lws_mirror(struct libwebsocket_context * this,
 
 		if (!flood)
 			fprintf(stderr, "%d bytes from %s: req=%ld "
-				"time=%lu.%lums\n", (int)len, address, l,
+				"time=%lu.%lums\n", (int)len, address, (long)l,
 			       (iv - psd->ringbuffer[n].issue_timestamp) / 1000,
 			((iv - psd->ringbuffer[n].issue_timestamp) / 100) % 10);
 		else
@@ -338,7 +337,7 @@ int main(int argc, char **argv)
 	char ip[30];
 #ifndef WIN32
 	struct sigaction sa;
-	// struct winsize w;
+	struct winsize w;
 #endif
 	struct timeval tv;
 	unsigned long oldus = 0;
@@ -420,10 +419,10 @@ int main(int argc, char **argv)
 	}
 
 #ifndef WIN32
-	// if (isatty(STDOUT_FILENO))
-	// 	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != -1)
-	// 		if (w.ws_col > 0)
-	// 			screen_width = w.ws_col;
+	if (isatty(STDOUT_FILENO))
+		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != -1)
+			if (w.ws_col > 0)
+				screen_width = w.ws_col;
 #endif
 
 	info.port = CONTEXT_PORT_NO_LISTEN;

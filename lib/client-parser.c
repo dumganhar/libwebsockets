@@ -1,7 +1,7 @@
 /*
  * libwebsockets - small server side websockets and web server implementation
  *
- * Copyright (C) 2010-2013 Andy Green <andy@warmcat.com>
+ * Copyright (C) 2010-2014 Andy Green <andy@warmcat.com>
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -26,10 +26,7 @@ int libwebsocket_client_rx_sm(struct libwebsocket *wsi, unsigned char c)
 	int callback_action = LWS_CALLBACK_CLIENT_RECEIVE;
 	int handled;
 	struct lws_tokens eff_buf;
-#ifndef LWS_NO_EXTENSIONS
-	int n;
 	int m;
-#endif
 
 	switch (wsi->lws_rx_parse_state) {
 	case LWS_RXPS_NEW:
@@ -217,8 +214,10 @@ int libwebsocket_client_rx_sm(struct libwebsocket *wsi, unsigned char c)
 
 	case LWS_RXPS_PAYLOAD_UNTIL_LENGTH_EXHAUSTED:
 
-		if (!wsi->u.ws.rx_user_buffer)
+		if (!wsi->u.ws.rx_user_buffer) {
 			lwsl_err("NULL client rx_user_buffer\n");
+			return 1;
+		}
 
 		if ((!wsi->u.ws.this_frame_masked) || wsi->u.ws.all_zero_nonce)
 			wsi->u.ws.rx_user_buffer[LWS_SEND_BUFFER_PRE_PADDING +
@@ -287,17 +286,49 @@ spill:
 			return -1;
 
 		case LWS_WS_OPCODE_07__PING:
-			lwsl_info("client received ping, doing pong\n");
-			/*
-			 * parrot the ping packet payload back as a pong
-			 * !!! this may block or have partial write or fail
-			 * !!! very unlikely if the ping size is small
-			 */
-			libwebsocket_write(wsi, (unsigned char *)
-			    &wsi->u.ws.rx_user_buffer[
-				LWS_SEND_BUFFER_PRE_PADDING],
-					wsi->u.ws.rx_user_buffer_head,
-								LWS_WRITE_PONG);
+			lwsl_info("received %d byte ping, sending pong\n",
+						 wsi->u.ws.rx_user_buffer_head);
+
+			if (wsi->u.ws.ping_pending_flag) {
+				/*
+				 * there is already a pending ping payload
+				 * we should just log and drop
+				 */
+				lwsl_parser("DROP PING since one pending\n");
+				goto ping_drop;
+			}
+
+			/* control packets can only be < 128 bytes long */
+			if (wsi->u.ws.rx_user_buffer_head > 128 - 4) {
+				lwsl_parser("DROP PING payload too large\n");
+				goto ping_drop;
+			}
+
+			/* if existing buffer is too small, drop it */
+			if (wsi->u.ws.ping_payload_buf &&
+			    wsi->u.ws.ping_payload_alloc < wsi->u.ws.rx_user_buffer_head)
+				lws_free2(wsi->u.ws.ping_payload_buf);
+
+			/* if no buffer, allocate it */
+			if (!wsi->u.ws.ping_payload_buf) {
+				wsi->u.ws.ping_payload_buf = lws_malloc(wsi->u.ws.rx_user_buffer_head
+									+ LWS_SEND_BUFFER_PRE_PADDING);
+				wsi->u.ws.ping_payload_alloc =
+					wsi->u.ws.rx_user_buffer_head;
+			}
+
+			/* stash the pong payload */
+			memcpy(wsi->u.ws.ping_payload_buf + LWS_SEND_BUFFER_PRE_PADDING,
+			       &wsi->u.ws.rx_user_buffer[LWS_SEND_BUFFER_PRE_PADDING],
+				wsi->u.ws.rx_user_buffer_head);
+
+			wsi->u.ws.ping_payload_len = wsi->u.ws.rx_user_buffer_head;
+			wsi->u.ws.ping_pending_flag = 1;
+
+			/* get it sent as soon as possible */
+			libwebsocket_callback_on_writable(wsi->protocol->owning_server, wsi);
+ping_drop:
+			wsi->u.ws.rx_user_buffer_head = 0;
 			handled = 1;
 			break;
 
@@ -319,7 +350,7 @@ spill:
 		default:
 
 			lwsl_parser("Reserved opc 0x%2X\n", wsi->u.ws.opcode);
-#ifndef LWS_NO_EXTENSIONS
+
 			/*
 			 * It's something special we can't understand here.
 			 * Pass the payload up to the extension's parsing
@@ -329,29 +360,18 @@ spill:
 			eff_buf.token = &wsi->u.ws.rx_user_buffer[
 						   LWS_SEND_BUFFER_PRE_PADDING];
 			eff_buf.token_len = wsi->u.ws.rx_user_buffer_head;
+			
+			if (lws_ext_callback_for_each_active(wsi,
+				LWS_EXT_CALLBACK_EXTENDED_PAYLOAD_RX,
+					&eff_buf, 0) <= 0) { /* not handle or fail */
 
-			for (n = 0; n < wsi->count_active_extensions; n++) {
-				m = wsi->active_extensions[n]->callback(
-					wsi->protocol->owning_server,
-					wsi->active_extensions[n], wsi,
-					LWS_EXT_CALLBACK_EXTENDED_PAYLOAD_RX,
-					    wsi->active_extensions_user[n],
-								   &eff_buf, 0);
-				if (m)
-					handled = 1;
-			}
-
-			if (!handled) {
-#else
-			{
-#endif
 				lwsl_ext("Unhandled ext opc 0x%x\n",
 							      wsi->u.ws.opcode);
 				wsi->u.ws.rx_user_buffer_head = 0;
 
 				return 0;
 			}
-
+			handled = 1;
 			break;
 		}
 
@@ -366,23 +386,14 @@ spill:
 		eff_buf.token = &wsi->u.ws.rx_user_buffer[
 						LWS_SEND_BUFFER_PRE_PADDING];
 		eff_buf.token_len = wsi->u.ws.rx_user_buffer_head;
-#ifndef LWS_NO_EXTENSIONS
-		for (n = 0; n < wsi->count_active_extensions; n++) {
-			m = wsi->active_extensions[n]->callback(
-				wsi->protocol->owning_server,
-				wsi->active_extensions[n], wsi,
+		
+		if (lws_ext_callback_for_each_active(wsi,
 				LWS_EXT_CALLBACK_PAYLOAD_RX,
-				wsi->active_extensions_user[n],
-				&eff_buf, 0);
-			if (m < 0) {
-				lwsl_ext(
-					"Ext '%s' failed to handle payload!\n",
-					       wsi->active_extensions[n]->name);
-				return -1;
-			}
-		}
-#endif
-		if (eff_buf.token_len <= 0)
+						&eff_buf, 0) < 0) /* fail */
+			return -1;
+
+		if (eff_buf.token_len <= 0 &&
+			    callback_action != LWS_CALLBACK_CLIENT_RECEIVE_PONG)
 			goto already_done;
 
 		eff_buf.token[eff_buf.token_len] = '\0';
@@ -393,13 +404,17 @@ spill:
 		if (callback_action == LWS_CALLBACK_CLIENT_RECEIVE_PONG)
 			lwsl_info("Client doing pong callback\n");
 
-		wsi->protocol->callback(
+		m = wsi->protocol->callback(
 			wsi->protocol->owning_server,
 			wsi,
 			(enum libwebsocket_callback_reasons)callback_action,
 			wsi->user_space,
 			eff_buf.token,
 			eff_buf.token_len);
+
+		/* if user code wants to close, let caller know */
+		if (m)
+			return 1;
 
 already_done:
 		wsi->u.ws.rx_user_buffer_head = 0;
@@ -416,7 +431,6 @@ illegal_ctl_length:
 	lwsl_warn("Control frame asking for extended length is illegal\n");
 	/* kill the connection */
 	return -1;
-
 }
 
 
